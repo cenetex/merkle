@@ -217,11 +217,80 @@ static void test_position_arithmetic(void) {
     ASSERT(n == 1 && heights[0] == 0);
 }
 
+/* For every count C in 1..MAX_N, build a fresh MMR and verify every
+ * leaf's proof round-trips against the snapshot's root. Catches drift
+ * between proof construction and verification, and would have caught
+ * the torn-write regression class fixed in the previous PR by failing
+ * round-trips at the irregular peak counts. */
+static void test_property_round_trip_dense(void) {
+    fprintf(stderr, "test_property_round_trip_dense:\n");
+    enum { MAX_N = 128 };
+    uint8_t leaves[MAX_N][32];
+    for (int i = 0; i < MAX_N; i++) make_leaf(i, leaves[i]);
+    for (size_t C = 1; C <= MAX_N; C++) {
+        merkle_mmr_t *m = merkle_mmr_new(sha256_pair);
+        for (size_t i = 0; i < C; i++) merkle_mmr_append(m, leaves[i]);
+        uint8_t root[32];
+        merkle_mmr_root(m, root);
+        for (size_t i = 0; i < C; i++) {
+            uint8_t proof[MERKLE_MMR_MAX_PROOF_LEN][32];
+            size_t peak_idx = 0;
+            int len = merkle_mmr_proof(m, i, proof, &peak_idx);
+            if (len < 0) {
+                fprintf(stderr, "    proof build failed C=%zu leaf=%zu\n", C, i);
+                failures++;
+                continue;
+            }
+            bool ok = merkle_mmr_verify(sha256_pair, leaves[i], i,
+                                         (const uint8_t (*)[32])proof,
+                                         (size_t)len, peak_idx, C, root);
+            if (!ok) {
+                fprintf(stderr, "    verify failed C=%zu leaf=%zu\n", C, i);
+                failures++;
+            }
+        }
+        merkle_mmr_free(m);
+    }
+}
+
+/* SPEC §5: an empty MMR's root is 32 zero bytes, and the verifier must
+ * reject any proof against it (leaf_idx < leaf_count is unsatisfiable). */
+static void test_empty_mmr(void) {
+    fprintf(stderr, "test_empty_mmr:\n");
+    merkle_mmr_t *m = merkle_mmr_new(sha256_pair);
+    ASSERT(m != NULL);
+    ASSERT(merkle_mmr_leaf_count(m) == 0);
+    ASSERT(merkle_mmr_node_count(m) == 0);
+
+    uint8_t root[32];
+    /* Pre-fill with non-zero so we can detect that root() actually wrote. */
+    memset(root, 0xab, 32);
+    merkle_mmr_root(m, root);
+    uint8_t zero[32] = {0};
+    ASSERT(memcmp(root, zero, 32) == 0);
+
+    /* Verifier must reject: leaf_idx (0) is not < leaf_count (0). */
+    uint8_t leaf[32] = {0};
+    bool ok = merkle_mmr_verify(sha256_pair, leaf, 0,
+                                 NULL, 0, 0, 0, root);
+    ASSERT(!ok);
+
+    /* Proof construction on empty MMR must fail. */
+    uint8_t proof[MERKLE_MMR_MAX_PROOF_LEN][32];
+    size_t peak_idx = 0;
+    int len = merkle_mmr_proof(m, 0, proof, &peak_idx);
+    ASSERT(len < 0);
+
+    merkle_mmr_free(m);
+}
+
 int main(void) {
     test_position_arithmetic();
     test_root_at_each_count();
     test_proof_round_trip();
     test_proof_rejects_tamper();
+    test_property_round_trip_dense();
+    test_empty_mmr();
     if (failures > 0) {
         fprintf(stderr, "\n%d failure(s)\n", failures);
         return 1;
