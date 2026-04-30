@@ -85,6 +85,11 @@ leaf_index_to_pos(i):
 Verifiers compute leaf positions independently from `leaf_idx`; the
 position is **not** transmitted in proofs.
 
+The closed form `pos = 2*i + 1 - popcount(i)` is well-defined only for
+`i < 2^63`; the spec does not support MMRs with more than `2^63 - 1`
+leaves. This is far beyond any plausible deployment but is the actual
+upper bound, not the `2^64` implied by the 64-bit calldata fields.
+
 ## 3. Peak set
 
 After N leaves are appended, the MMR has a set of peaks: the roots of
@@ -172,6 +177,16 @@ format-identical regardless of which snapshot is being referenced, and
 the on-chain anchor commits to (root, leaf_count, signature) as a
 tuple anyway, so a length-extension attack would have to forge the
 signature, not the root.
+
+### Empty MMR
+
+The root of an MMR with `leaf_count == 0` is defined as the 32 zero
+bytes. This is a sentinel — a verifier MUST also check `leaf_count > 0`
+before treating any inclusion proof as meaningful, because `leaf_idx <
+leaf_count` is unsatisfiable when `leaf_count == 0`. The reference
+implementation's `merkle_mmr_root` writes 32 zero bytes in this case,
+and `merkle_mmr_verify` rejects any proof whose `leaf_idx` is out of
+range.
 
 ## 6. Verification algorithm
 
