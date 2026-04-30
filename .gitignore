@@ -1,0 +1,5 @@
+test_mmr
+test_mmr_san
+append_prove
+*.o
+*.dSYM/

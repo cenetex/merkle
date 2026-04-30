@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+        exclude:
+          - os: macos-latest
+            cc: gcc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          $CC --version
+          $CC -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
+              -Iinclude -Itests tests/test_mmr.c -o test_mmr
+          ./test_mmr
+      - name: Build example
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          $CC -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
+              -Iinclude -Itests examples/append_prove.c -o append_prove
+          ./append_prove
+
+  ubsan-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sanitizer build
+        run: |
+          clang -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g \
+                -fsanitize=address,undefined \
+                -fno-omit-frame-pointer \
+                -Iinclude -Itests tests/test_mmr.c -o test_mmr_san
+          ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ./test_mmr_san

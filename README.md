@@ -1,0 +1,115 @@
+# cenetex/merkle
+
+A small, single-header C implementation of a **Merkle Mountain Range**
+(append-only forest of Merkle trees), suitable for vendoring into any
+project that wants to commit a growing set of items with O(log N)
+inclusion proofs and a tiny on-chain footprint.
+
+```c
+#define MERKLE_IMPL
+#include "merkle.h"
+
+void sha256_pair(const uint8_t l[32], const uint8_t r[32], uint8_t o[32]);
+
+merkle_mmr_t *m = merkle_mmr_new(sha256_pair);
+merkle_mmr_append(m, leaf0);
+merkle_mmr_append(m, leaf1);
+/* ... */
+uint8_t root[32];
+merkle_mmr_root(m, root);
+
+uint8_t proof[MERKLE_MMR_MAX_PROOF_LEN][32];
+size_t  peak_idx;
+int     proof_len = merkle_mmr_proof(m, /*leaf_idx=*/3, proof, &peak_idx);
+
+bool ok = merkle_mmr_verify(sha256_pair,
+                             leaf3, /*leaf_idx=*/3,
+                             (const uint8_t (*)[32])proof, proof_len,
+                             peak_idx, merkle_mmr_leaf_count(m), root);
+```
+
+## Why an MMR
+
+For any append-only set (transaction logs, destroyed-asset ledgers,
+inclusion-set commitments), an MMR gives you:
+
+- **O(log N) inclusion proofs**, ~17 hashes for 100K leaves.
+- **Append in amortized O(1)**: most appends touch only the new leaf;
+  occasional ones cascade up the tree.
+- **A single 32-byte root** that commits to the entire set, suitable
+  for posting to a chain.
+- **Stateless verification** — verifiers don't need the full tree, just
+  the root + the proof + the leaf.
+- **Deterministic byte output** — given the same hash function and the
+  same leaf sequence, every implementation produces the same root and
+  the same proofs. Verifiers in different languages can interoperate
+  without coordinating internal data structures.
+
+## Why this implementation
+
+- **Single header** (`include/merkle.h`). Drop into any C project.
+- **Hash-function-agnostic.** Caller supplies a `H(left || right) →
+  out` callback. Use SHA-256, Poseidon, Blake3, anything.
+- **No global state.** All storage lives behind an opaque handle the
+  caller owns and frees.
+- **Public-domain-equivalent license** (MIT-0; see `LICENSE`).
+- **Spec-first.** `SPEC.md` is the canonical-form contract; the C code
+  is the reference implementation against it. Verifiers in other
+  languages should target the spec, not this code.
+
+## Vendoring into your project
+
+Copy `include/merkle.h` into your tree (e.g. `vendor/cenetex/merkle.h`)
+along with this README's snippet pointing to the upstream commit you
+pinned. We follow the `xor_singleheader` model: pin a commit, never
+edit in place.
+
+Example attribution stub:
+
+```
+# vendor/cenetex/ATTRIBUTION.md
+- Upstream: https://github.com/cenetex/merkle
+- Pinned commit: <sha>
+- License: MIT-0 (see upstream LICENSE)
+```
+
+## Spec
+
+See `SPEC.md` for the canonical-form contract every verifier in the
+network must agree on:
+
+- 1-based position numbering (Grin-style)
+- Right-fold peak bagging
+- Leaf count NOT folded into any hash
+- Proof byte layout for on-chain calldata
+- Versioning rules
+
+The current spec version is **1**.
+
+## Building / testing
+
+```
+$ cc -std=c11 -O2 -Iinclude -Itests tests/test_mmr.c -o test_mmr
+$ ./test_mmr
+test_position_arithmetic:
+test_root_at_each_count:
+test_proof_round_trip:
+test_proof_rejects_tamper:
+all green
+```
+
+CI (GitHub Actions) runs the suite on Linux + macOS on every push.
+
+## Status
+
+- v1.0.0 ships the canonical SHA-256 golden vectors (16 leaves) pinned
+  in `tests/test_mmr.c`. Any implementation claiming spec-compliance
+  must reproduce these byte-for-byte.
+
+## Used by
+
+- [Signal](https://github.com/cenetex/signal) — destroyed-rock ledger
+  and on-chain epoch anchoring (#285).
+
+If you vendor this and find a real spec ambiguity, file an issue.
+That's how the spec gets sharper.
