@@ -65,6 +65,22 @@ jobs:
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             ./fuzz_verify -max_total_time=60 -print_final_stats=1
 
+  conformance-vectors:
+    # Regenerate tests/vectors.txt from the current code and diff
+    # against the committed copy. Any drift in root, proof, or encode
+    # behavior produces a different file and fails CI. Other-language
+    # ports consume tests/vectors.txt as their conformance suite, so
+    # this job is what guarantees the file stays correct.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate and diff
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
+              -Iinclude -Itests tests/gen_vectors.c -o gen_vectors
+          ./gen_vectors > /tmp/vectors.txt
+          diff -u tests/vectors.txt /tmp/vectors.txt
+
   fuzz-decode-verify:
     # Wire-level fuzzer: raw bytes → merkle_mmr_proof_decode → verify.
     # Catches OOB/UB in the parser specifically (the path an on-chain
