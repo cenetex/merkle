@@ -64,3 +64,21 @@ jobs:
           ASAN_OPTIONS=abort_on_error=1 \
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             ./fuzz_verify -max_total_time=60 -print_final_stats=1
+
+  fuzz-decode-verify:
+    # Wire-level fuzzer: raw bytes → merkle_mmr_proof_decode → verify.
+    # Catches OOB/UB in the parser specifically (the path an on-chain
+    # verifier would actually take on adversarial calldata).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fuzz decode -> verify
+        run: |
+          clang -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g \
+                -fsanitize=fuzzer,address,undefined \
+                -fno-omit-frame-pointer \
+                -Iinclude -Itests tests/fuzz_decode_verify.c \
+                -o fuzz_decode_verify
+          ASAN_OPTIONS=abort_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ./fuzz_decode_verify -max_total_time=60 -print_final_stats=1

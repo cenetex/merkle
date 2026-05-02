@@ -84,6 +84,49 @@ bool merkle_mmr_verify(merkle_hash_pair_fn hash_pair,
                        size_t leaf_count,
                        const uint8_t expected_root[32]);
 
+/* --- Calldata encoding (SPEC.md §4) ------------------------------ */
+
+/* Maximum encoded proof length in bytes. 64 B header + worst-case
+ * proof body. */
+#define MERKLE_MMR_MAX_ENCODED_LEN (64u + MERKLE_MMR_MAX_PROOF_LEN * 32u)
+
+/* Encode (leaf, leaf_idx, leaf_count, peak_idx, proof[]) into the
+ * canonical calldata byte layout from SPEC.md §4:
+ *
+ *   [ 0..31] leaf hash
+ *   [32..39] leaf_idx     (u64 LE)
+ *   [40..47] leaf_count   (u64 LE)
+ *   [48..55] peak_idx     (u64 LE)
+ *   [56..63] proof_len    (u64 LE)
+ *   [64...]  proof_len * 32 bytes of proof hashes
+ *
+ * Returns the number of bytes written, or 0 on error (NULL pointer,
+ * proof_len > MERKLE_MMR_MAX_PROOF_LEN, or out_cap too small). */
+size_t merkle_mmr_proof_encode(const uint8_t leaf[32],
+                                uint64_t leaf_idx,
+                                uint64_t leaf_count,
+                                uint64_t peak_idx,
+                                const uint8_t (*proof)[32],
+                                size_t proof_len,
+                                uint8_t *out,
+                                size_t out_cap);
+
+/* Decode the canonical calldata layout into structured outputs.
+ * Returns true on success. Validates the input length matches the
+ * encoded proof_len exactly (no trailing bytes) and rejects proof_len
+ * > MERKLE_MMR_MAX_PROOF_LEN. On failure, output values are
+ * unspecified.
+ *
+ * Decoding does NOT verify the proof — call merkle_mmr_verify on the
+ * decoded values to check inclusion against an expected root. */
+bool merkle_mmr_proof_decode(const uint8_t *in, size_t in_len,
+                              uint8_t leaf_out[32],
+                              uint64_t *leaf_idx_out,
+                              uint64_t *leaf_count_out,
+                              uint64_t *peak_idx_out,
+                              uint8_t proof_out[MERKLE_MMR_MAX_PROOF_LEN][32],
+                              size_t *proof_len_out);
+
 /* Helpers exposed for advanced users (verifier shims, golden-vector
  * tests). All match SPEC.md §2-3. */
 
@@ -437,6 +480,67 @@ bool merkle_mmr_verify(merkle_hash_pair_fn hash_pair,
     }
     #undef MERKLE__PEAK_AT
     return memcmp(fold, expected_root, 32) == 0;
+}
+
+/* --- SPEC §4: canonical calldata encode / decode --------------- */
+
+static inline void merkle__write_u64_le(uint8_t out[8], uint64_t v) {
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)(v >> (i * 8));
+}
+
+static inline uint64_t merkle__read_u64_le(const uint8_t in[8]) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)in[i] << (i * 8);
+    return v;
+}
+
+size_t merkle_mmr_proof_encode(const uint8_t leaf[32],
+                                uint64_t leaf_idx,
+                                uint64_t leaf_count,
+                                uint64_t peak_idx,
+                                const uint8_t (*proof)[32],
+                                size_t proof_len,
+                                uint8_t *out,
+                                size_t out_cap) {
+    if (!leaf || !out) return 0;
+    if (proof_len > 0 && !proof) return 0;
+    if (proof_len > MERKLE_MMR_MAX_PROOF_LEN) return 0;
+    size_t need = 64 + proof_len * 32;
+    if (out_cap < need) return 0;
+    memcpy(out, leaf, 32);
+    merkle__write_u64_le(out + 32, leaf_idx);
+    merkle__write_u64_le(out + 40, leaf_count);
+    merkle__write_u64_le(out + 48, peak_idx);
+    merkle__write_u64_le(out + 56, (uint64_t)proof_len);
+    for (size_t i = 0; i < proof_len; i++) {
+        memcpy(out + 64 + i * 32, proof[i], 32);
+    }
+    return need;
+}
+
+bool merkle_mmr_proof_decode(const uint8_t *in, size_t in_len,
+                              uint8_t leaf_out[32],
+                              uint64_t *leaf_idx_out,
+                              uint64_t *leaf_count_out,
+                              uint64_t *peak_idx_out,
+                              uint8_t proof_out[MERKLE_MMR_MAX_PROOF_LEN][32],
+                              size_t *proof_len_out) {
+    if (!in || !leaf_out || !leaf_idx_out || !leaf_count_out ||
+        !peak_idx_out || !proof_out || !proof_len_out) return false;
+    if (in_len < 64) return false;
+    uint64_t proof_len = merkle__read_u64_le(in + 56);
+    if (proof_len > (uint64_t)MERKLE_MMR_MAX_PROOF_LEN) return false;
+    /* Exact-length match: no trailing bytes, no truncation. */
+    if (in_len != (size_t)64 + (size_t)proof_len * 32) return false;
+    memcpy(leaf_out, in, 32);
+    *leaf_idx_out = merkle__read_u64_le(in + 32);
+    *leaf_count_out = merkle__read_u64_le(in + 40);
+    *peak_idx_out = merkle__read_u64_le(in + 48);
+    *proof_len_out = (size_t)proof_len;
+    for (size_t i = 0; i < (size_t)proof_len; i++) {
+        memcpy(proof_out[i], in + 64 + i * 32, 32);
+    }
+    return true;
 }
 
 #endif /* MERKLE_IMPL */

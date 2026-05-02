@@ -143,6 +143,12 @@ All multi-byte integers are little-endian. The on-disk anchor format
 (spec'd separately by the consumer) wraps this with a signature; this
 spec is only the proof bytes.
 
+The C reference implementation exposes this layout via
+`merkle_mmr_proof_encode` and `merkle_mmr_proof_decode` (see
+`merkle.h`); the byte-layout test in `tests/test_mmr.c`
+(`test_calldata_byte_layout`) pins the offsets and endianness with
+known-pattern inputs so any encoder/decoder drift fails CI.
+
 ## 5. Root computation
 
 The MMR root is computed by:
