@@ -38,8 +38,10 @@ extern "C" {
 
 #define MERKLE_SPEC_VERSION 1
 
-/* Maximum proof length in 32-byte hashes. Covers up to 2^64 leaves
- * (path height <= 63, peak count <= 64). 128 hashes is generous. */
+/* Maximum proof length in 32-byte hashes. The spec ceiling on
+ * leaf_count is 2^63 - 1 (see SPEC §2, leaf_index_to_pos overflow),
+ * which bounds path height at 62 and peak count at 63. 128 hashes
+ * is generous. */
 #define MERKLE_MMR_MAX_PROOF_LEN 128
 
 typedef void (*merkle_hash_pair_fn)(const uint8_t left[32],
