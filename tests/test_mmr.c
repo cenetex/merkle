@@ -284,6 +284,159 @@ static void test_empty_mmr(void) {
     merkle_mmr_free(m);
 }
 
+/* Encode every proof from a 13-leaf MMR, decode it back, and confirm
+ * the decoded values match the originals byte-for-byte AND verify
+ * against the same root. Closes the loop between SPEC §4 and the
+ * structured C API. */
+static void test_calldata_round_trip(void) {
+    fprintf(stderr, "test_calldata_round_trip:\n");
+    merkle_mmr_t *m = merkle_mmr_new(sha256_pair);
+    uint8_t leaves[13][32];
+    for (int i = 0; i < 13; i++) {
+        make_leaf(i, leaves[i]);
+        merkle_mmr_append(m, leaves[i]);
+    }
+    uint8_t root[32];
+    merkle_mmr_root(m, root);
+
+    for (int i = 0; i < 13; i++) {
+        uint8_t proof[MERKLE_MMR_MAX_PROOF_LEN][32];
+        size_t peak_idx = 0;
+        int len = merkle_mmr_proof(m, (size_t)i, proof, &peak_idx);
+        ASSERT(len > 0);
+
+        uint8_t encoded[MERKLE_MMR_MAX_ENCODED_LEN];
+        size_t enc_len = merkle_mmr_proof_encode(
+            leaves[i], (uint64_t)i, 13, peak_idx,
+            (const uint8_t (*)[32])proof, (size_t)len,
+            encoded, sizeof(encoded));
+        ASSERT(enc_len == 64u + (size_t)len * 32u);
+
+        uint8_t leaf_d[32];
+        uint64_t leaf_idx_d = 0, leaf_count_d = 0, peak_idx_d = 0;
+        uint8_t proof_d[MERKLE_MMR_MAX_PROOF_LEN][32];
+        size_t proof_len_d = 0;
+        ASSERT(merkle_mmr_proof_decode(encoded, enc_len,
+                                        leaf_d, &leaf_idx_d, &leaf_count_d,
+                                        &peak_idx_d, proof_d, &proof_len_d));
+        ASSERT(memcmp(leaf_d, leaves[i], 32) == 0);
+        ASSERT(leaf_idx_d == (uint64_t)i);
+        ASSERT(leaf_count_d == 13u);
+        ASSERT(peak_idx_d == (uint64_t)peak_idx);
+        ASSERT(proof_len_d == (size_t)len);
+        for (int k = 0; k < len; k++) {
+            ASSERT(memcmp(proof_d[k], proof[k], 32) == 0);
+        }
+
+        bool ok = merkle_mmr_verify(sha256_pair, leaf_d, (size_t)leaf_idx_d,
+                                     (const uint8_t (*)[32])proof_d,
+                                     proof_len_d, (size_t)peak_idx_d,
+                                     (size_t)leaf_count_d, root);
+        ASSERT(ok);
+    }
+    merkle_mmr_free(m);
+}
+
+/* Pin the canonical SPEC §4 byte layout: encode a fully-populated
+ * proof with distinctive patterns and assert each field appears at
+ * its documented offset, in little-endian, with the right contents.
+ * Any change to the encoding breaks this test. */
+static void test_calldata_byte_layout(void) {
+    fprintf(stderr, "test_calldata_byte_layout:\n");
+    uint8_t leaf[32];
+    for (int i = 0; i < 32; i++) leaf[i] = (uint8_t)(0x10 + i);
+    uint8_t proof[2][32];
+    for (int i = 0; i < 32; i++) proof[0][i] = (uint8_t)(0xa0 + i);
+    for (int i = 0; i < 32; i++) proof[1][i] = (uint8_t)(0xc0 + i);
+
+    uint8_t out[256];
+    size_t n = merkle_mmr_proof_encode(
+        leaf,
+        /*leaf_idx*/   0x0102030405060708ull,
+        /*leaf_count*/ 0x1112131415161718ull,
+        /*peak_idx*/   0x2122232425262728ull,
+        (const uint8_t (*)[32])proof, 2,
+        out, sizeof(out));
+    ASSERT(n == 64u + 2u * 32u);
+
+    ASSERT(memcmp(out, leaf, 32) == 0);
+    static const uint8_t exp_leaf_idx[8]   = {0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01};
+    static const uint8_t exp_leaf_count[8] = {0x18,0x17,0x16,0x15,0x14,0x13,0x12,0x11};
+    static const uint8_t exp_peak_idx[8]   = {0x28,0x27,0x26,0x25,0x24,0x23,0x22,0x21};
+    static const uint8_t exp_proof_len[8]  = {0x02,0,0,0,0,0,0,0};
+    ASSERT(memcmp(out + 32, exp_leaf_idx,   8) == 0);
+    ASSERT(memcmp(out + 40, exp_leaf_count, 8) == 0);
+    ASSERT(memcmp(out + 48, exp_peak_idx,   8) == 0);
+    ASSERT(memcmp(out + 56, exp_proof_len,  8) == 0);
+    ASSERT(memcmp(out + 64, proof[0], 32) == 0);
+    ASSERT(memcmp(out + 96, proof[1], 32) == 0);
+}
+
+/* Decoder must reject every flavor of malformed input: short header,
+ * truncated body, trailing garbage, oversized proof_len. */
+static void test_calldata_rejects_malformed(void) {
+    fprintf(stderr, "test_calldata_rejects_malformed:\n");
+    merkle_mmr_t *m = merkle_mmr_new(sha256_pair);
+    uint8_t leaves[7][32];
+    for (int i = 0; i < 7; i++) {
+        make_leaf(i, leaves[i]);
+        merkle_mmr_append(m, leaves[i]);
+    }
+    uint8_t proof[MERKLE_MMR_MAX_PROOF_LEN][32];
+    size_t peak_idx = 0;
+    int len = merkle_mmr_proof(m, 3, proof, &peak_idx);
+    ASSERT(len > 0);
+
+    uint8_t encoded[MERKLE_MMR_MAX_ENCODED_LEN];
+    size_t enc_len = merkle_mmr_proof_encode(
+        leaves[3], 3, 7, peak_idx,
+        (const uint8_t (*)[32])proof, (size_t)len,
+        encoded, sizeof(encoded));
+    ASSERT(enc_len > 0);
+
+    uint8_t leaf_d[32];
+    uint64_t leaf_idx_d, leaf_count_d, peak_idx_d;
+    uint8_t proof_d[MERKLE_MMR_MAX_PROOF_LEN][32];
+    size_t proof_len_d;
+
+    /* Header truncation. */
+    ASSERT(!merkle_mmr_proof_decode(encoded, 63,
+                                     leaf_d, &leaf_idx_d, &leaf_count_d,
+                                     &peak_idx_d, proof_d, &proof_len_d));
+    /* Body truncation (one byte short). */
+    ASSERT(!merkle_mmr_proof_decode(encoded, enc_len - 1,
+                                     leaf_d, &leaf_idx_d, &leaf_count_d,
+                                     &peak_idx_d, proof_d, &proof_len_d));
+    /* Trailing byte (one past the end). */
+    uint8_t too_long[MERKLE_MMR_MAX_ENCODED_LEN + 1];
+    memcpy(too_long, encoded, enc_len);
+    too_long[enc_len] = 0xab;
+    ASSERT(!merkle_mmr_proof_decode(too_long, enc_len + 1,
+                                     leaf_d, &leaf_idx_d, &leaf_count_d,
+                                     &peak_idx_d, proof_d, &proof_len_d));
+    /* proof_len > MERKLE_MMR_MAX_PROOF_LEN. Forge an oversized count
+     * field and resize input to match what it would claim. */
+    uint8_t bad[MERKLE_MMR_MAX_ENCODED_LEN];
+    memcpy(bad, encoded, enc_len);
+    uint64_t bad_len = (uint64_t)MERKLE_MMR_MAX_PROOF_LEN + 1u;
+    for (int i = 0; i < 8; i++) bad[56 + i] = (uint8_t)(bad_len >> (i * 8));
+    ASSERT(!merkle_mmr_proof_decode(bad, enc_len,
+                                     leaf_d, &leaf_idx_d, &leaf_count_d,
+                                     &peak_idx_d, proof_d, &proof_len_d));
+
+    /* Encoder also rejects oversized proof_len and undersized buffer. */
+    uint8_t small_buf[63];
+    ASSERT(merkle_mmr_proof_encode(leaves[3], 3, 7, peak_idx,
+                                    (const uint8_t (*)[32])proof, (size_t)len,
+                                    small_buf, sizeof(small_buf)) == 0);
+    ASSERT(merkle_mmr_proof_encode(leaves[3], 3, 7, peak_idx,
+                                    (const uint8_t (*)[32])proof,
+                                    MERKLE_MMR_MAX_PROOF_LEN + 1,
+                                    encoded, sizeof(encoded)) == 0);
+
+    merkle_mmr_free(m);
+}
+
 int main(void) {
     test_position_arithmetic();
     test_root_at_each_count();
@@ -291,6 +444,9 @@ int main(void) {
     test_proof_rejects_tamper();
     test_property_round_trip_dense();
     test_empty_mmr();
+    test_calldata_round_trip();
+    test_calldata_byte_layout();
+    test_calldata_rejects_malformed();
     if (failures > 0) {
         fprintf(stderr, "\n%d failure(s)\n", failures);
         return 1;
