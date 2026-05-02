@@ -166,36 +166,23 @@ size_t merkle_peak_heights(uint64_t leaf_count, uint8_t out[64]) {
     return n;
 }
 
-/* Position (1-based) of the kth peak, left-to-right. Each peak of
- * height h ends at the cumulative-end-of-its-subtree mark, which is
- * the running sum of (2^(h+1) - 1) over peaks already counted. */
-static uint64_t merkle__peak_pos(uint64_t leaf_count, size_t peak_idx) {
-    uint64_t pos = 0;
-    size_t k = 0;
+/* Emit the 1-based positions of all peaks in left-to-right order
+ * (largest height first). Returns the count written. `out` must hold
+ * at least 64 entries.
+ *
+ * Each peak of height h ends at the cumulative-end-of-its-subtree mark,
+ * the running sum of (2^(h+1) - 1) over peaks already counted. Doing
+ * this in a single forward pass replaces the O(pcount × 64) cost of
+ * calling a per-peak position helper from inside root/proof. */
+static size_t merkle__peak_positions(uint64_t leaf_count, uint64_t out[64]) {
+    size_t n = 0;
+    uint64_t cursor = 0;
     for (int b = 63; b >= 0; b--) {
         if (((leaf_count >> b) & 1u) == 0u) continue;
-        pos += ((uint64_t)1 << (b + 1)) - 1;
-        if (k == peak_idx) return pos;
-        k++;
+        cursor += ((uint64_t)1 << (b + 1)) - 1;
+        out[n++] = cursor;
     }
-    return 0;
-}
-
-/* Find which peak a 0-based leaf belongs to (left-to-right idx). */
-static size_t merkle__peak_for_leaf(uint64_t leaf_count, uint64_t leaf_idx) {
-    /* Walk the peaks from leftmost (height = MSB of leaf_count) and
-     * count how many leaves fit in each. The leftmost peak of height h
-     * covers 2^h leaves. */
-    uint64_t consumed = 0;
-    size_t k = 0;
-    for (int b = 63; b >= 0; b--) {
-        if (((leaf_count >> b) & 1u) == 0u) continue;
-        uint64_t leaves_in_peak = (uint64_t)1 << b;
-        if (leaf_idx < consumed + leaves_in_peak) return k;
-        consumed += leaves_in_peak;
-        k++;
-    }
-    return (size_t)-1;
+    return n;
 }
 
 /* --- Public API: lifecycle -------------------------------------- */
@@ -292,20 +279,18 @@ void merkle_mmr_root(const merkle_mmr_t *m, uint8_t out[32]) {
         memset(out, 0, 32);
         return;
     }
-    size_t pcount = merkle_peak_count(m->leaf_count);
+    uint64_t pos[64];
+    size_t pcount = merkle__peak_positions(m->leaf_count, pos);
     if (pcount == 1) {
-        uint64_t peak = merkle__peak_pos(m->leaf_count, 0);
-        memcpy(out, m->nodes[peak - 1], 32);
+        memcpy(out, m->nodes[pos[0] - 1], 32);
         return;
     }
     /* Right-fold bag: H(P_0, H(P_1, ... H(P_{k-2}, P_{k-1}))) */
     uint8_t acc[32];
-    uint64_t last = merkle__peak_pos(m->leaf_count, pcount - 1);
-    memcpy(acc, m->nodes[last - 1], 32);
+    memcpy(acc, m->nodes[pos[pcount - 1] - 1], 32);
     for (size_t i = pcount - 1; i > 0; i--) {
-        uint64_t prev = merkle__peak_pos(m->leaf_count, i - 1);
         uint8_t tmp[32];
-        m->hash_pair(m->nodes[prev - 1], acc, tmp);
+        m->hash_pair(m->nodes[pos[i - 1] - 1], acc, tmp);
         memcpy(acc, tmp, 32);
     }
     memcpy(out, acc, 32);
@@ -314,12 +299,9 @@ void merkle_mmr_root(const merkle_mmr_t *m, uint8_t out[32]) {
 /* --- Inclusion proof construction ------------------------------ */
 
 /* Walk leaf_idx up to its peak through the producer's stored array.
- * Each step picks the sibling using the height array, recording (a)
- * the sibling's hash and (b) which side (left=0, right=1) the sibling
- * was on relative to the climbing accumulator.
- *
- * Termination: when the accumulator's node has no same-height sibling
- * in the array (i.e. it's a peak), stop. */
+ * Each step records the sibling hash; when no same-height sibling
+ * exists, the current node is a peak — its 1-based position is used
+ * to identify which peak (left-to-right) the leaf belongs to. */
 int merkle_mmr_proof(const merkle_mmr_t *m, size_t leaf_idx,
                      uint8_t proof_out[MERKLE_MMR_MAX_PROOF_LEN][32],
                      size_t *out_peak) {
@@ -340,19 +322,18 @@ int merkle_mmr_proof(const merkle_mmr_t *m, size_t leaf_idx,
         if (right_sib < m->node_count && m->heights[right_sib] == h) {
             if (off >= MERKLE_MMR_MAX_PROOF_LEN) return -1;
             memcpy(proof_out[off++], m->nodes[right_sib], 32);
-            pos = right_sib + 1; /* parent is right-sibling+1 */
+            pos = right_sib + 1; /* parent's array slot is right-sibling+1 */
             continue;
         }
-        /* Otherwise try left-sibling (we are a right child). */
+        /* Otherwise try left-sibling (we are a right child). Parent's
+         * array slot is our slot + 1 (the merger emitted us, then the
+         * parent). */
         if (pos >= span) {
             size_t left_sib = pos - (size_t)span;
             if (m->heights[left_sib] == h) {
                 if (off >= MERKLE_MMR_MAX_PROOF_LEN) return -1;
                 memcpy(proof_out[off++], m->nodes[left_sib], 32);
-                pos = pos + 1; /* parent is right-child+1 */
-                /* But the parent is at our pos+1 in *array order* —
-                 * which is the next slot after `right` in the merger
-                 * (we are `right`). */
+                pos = pos + 1;
                 continue;
             }
         }
@@ -360,56 +341,27 @@ int merkle_mmr_proof(const merkle_mmr_t *m, size_t leaf_idx,
         break;
     }
 
-    /* Append all peaks except this one, in left-to-right order. */
-    size_t peak_idx = merkle__peak_for_leaf(m->leaf_count,
-                                             (uint64_t)leaf_idx);
-    if (peak_idx == (size_t)-1) return -1;
-    size_t pcount = merkle_peak_count(m->leaf_count);
+    /* Single bit-walk over leaf_count: emit every other peak's hash
+     * left-to-right, and identify the leaf's own peak by matching its
+     * 1-based position against the running cumulative endpoint. */
+    uint64_t leaf_peak_pos = (uint64_t)pos + 1;
+    uint64_t pp[64];
+    size_t pcount = merkle__peak_positions(m->leaf_count, pp);
+    size_t peak_idx = (size_t)-1;
     for (size_t k = 0; k < pcount; k++) {
-        if (k == peak_idx) continue;
+        if (pp[k] == leaf_peak_pos) {
+            peak_idx = k;
+            continue;
+        }
         if (off >= MERKLE_MMR_MAX_PROOF_LEN) return -1;
-        uint64_t pp = merkle__peak_pos(m->leaf_count, k);
-        memcpy(proof_out[off++], m->nodes[pp - 1], 32);
+        memcpy(proof_out[off++], m->nodes[pp[k] - 1], 32);
     }
+    if (peak_idx == (size_t)-1) return -1;  /* climb stopped at a non-peak */
     if (out_peak) *out_peak = peak_idx;
     return (int)off;
 }
 
 /* --- Stateless verifier ---------------------------------------- */
-
-/* Replay the producer's path-walk decisions for a given leaf index,
- * filling out_dirs[i] with 0 = sibling-on-right (we were left child)
- * and 1 = sibling-on-left (we were right child). Terminates after
- * peak_height steps; returns the count written, or -1 on shape error. */
-static int merkle__verify_path_dirs(uint64_t leaf_count, uint64_t leaf_idx,
-                                     uint8_t peak_height, int out_dirs[64]) {
-    /* The deterministic rule: at height h, the leaf belongs to a
-     * peak-subtree of height ≥ h. The parity of "(leaf_offset_within_
-     * peak) >> h & 1" tells us whether we are a left (bit=0) or right
-     * (bit=1) child at that height.
-     *
-     * leaf_offset_within_peak = leaf_idx - sum(2^h_i for peaks before
-     * the leaf's peak). */
-    /* Find the leaf's peak and its offset. */
-    uint64_t consumed = 0;
-    int found_peak_height = -1;
-    for (int b = 63; b >= 0; b--) {
-        if (((leaf_count >> b) & 1u) == 0u) continue;
-        uint64_t leaves_in_peak = (uint64_t)1 << b;
-        if (leaf_idx < consumed + leaves_in_peak) {
-            found_peak_height = b;
-            break;
-        }
-        consumed += leaves_in_peak;
-    }
-    if (found_peak_height < 0) return -1;
-    if ((uint8_t)found_peak_height != peak_height) return -1;
-    uint64_t offset = leaf_idx - consumed;
-    for (int h = 0; h < (int)peak_height; h++) {
-        out_dirs[h] = (int)((offset >> h) & 1u);
-    }
-    return (int)peak_height;
-}
 
 bool merkle_mmr_verify(merkle_hash_pair_fn hash_pair,
                        const uint8_t leaf[32],
@@ -423,59 +375,68 @@ bool merkle_mmr_verify(merkle_hash_pair_fn hash_pair,
         !expected_root) return false;
     if (leaf_idx >= leaf_count) return false;
 
-    uint8_t peaks_h[64];
-    size_t pcount = merkle_peak_heights((uint64_t)leaf_count, peaks_h);
-    if (peak_idx >= pcount) return false;
-
-    uint8_t peak_height = peaks_h[peak_idx];
+    /* Single bit-walk over leaf_count: count peaks, locate peak_idx's
+     * height, and bracket the leaf range covered by that peak. Replaces
+     * the prior peaks_h[64] + path_dirs[64] + peaks[64][32] = ~2.4 KB
+     * stack footprint with a few scalars. Same bytes computed, fewer
+     * intermediates materialized — important for constrained verifiers
+     * (e.g. on-chain programs with sub-4 KB stack budgets). */
+    size_t pcount = 0;
+    int peak_height_signed = -1;
+    uint64_t peak_lo = 0, peak_hi = 0;
+    uint64_t cursor = 0;
+    for (int b = 63; b >= 0; b--) {
+        if ((((uint64_t)leaf_count >> b) & 1u) == 0u) continue;
+        uint64_t span = (uint64_t)1 << b;
+        if (pcount == peak_idx) {
+            peak_height_signed = b;
+            peak_lo = cursor;
+            peak_hi = cursor + span;
+        }
+        cursor += span;
+        pcount++;
+    }
+    if (peak_height_signed < 0) return false;       /* peak_idx >= pcount */
+    if ((uint64_t)leaf_idx < peak_lo ||
+        (uint64_t)leaf_idx >= peak_hi) return false; /* leaf not in claimed peak */
+    uint8_t peak_height = (uint8_t)peak_height_signed;
     if (proof_len != (size_t)peak_height + (pcount - 1)) return false;
+    uint64_t offset_in_peak = (uint64_t)leaf_idx - peak_lo;
 
-    /* Climb the leaf's peak. */
+    /* Climb the leaf's peak. Direction at height h is the parity of
+     * (offset_in_peak >> h): 0 = we were a left child (sibling on right),
+     * 1 = we were a right child (sibling on left). */
     uint8_t acc[32];
     memcpy(acc, leaf, 32);
-    int dirs[64];
-    int d = merkle__verify_path_dirs((uint64_t)leaf_count,
-                                     (uint64_t)leaf_idx,
-                                     peak_height, dirs);
-    if (d != (int)peak_height) return false;
-    for (int i = 0; i < peak_height; i++) {
+    for (int h = 0; h < (int)peak_height; h++) {
         uint8_t tmp[32];
-        if (dirs[i] == 0) {
-            /* We were a left child; sibling is on the right. */
-            hash_pair(acc, proof[i], tmp);
+        if (((offset_in_peak >> h) & 1u) == 0u) {
+            hash_pair(acc, proof[h], tmp);
         } else {
-            /* We were a right child; sibling is on the left. */
-            hash_pair(proof[i], acc, tmp);
+            hash_pair(proof[h], acc, tmp);
         }
         memcpy(acc, tmp, 32);
     }
 
-    /* Reconstruct the full peak set. */
-    uint8_t peaks[64][32];
-    size_t off = (size_t)peak_height;
-    for (size_t k = 0; k < pcount; k++) {
-        if (k == peak_idx) {
-            memcpy(peaks[k], acc, 32);
-        } else {
-            if (off >= proof_len) return false;
-            memcpy(peaks[k], proof[off++], 32);
-        }
-    }
-    if (off != proof_len) return false;
-
-    /* Right-fold bag, mirroring merkle_mmr_root. */
-    uint8_t root[32];
+    /* Right-fold the peak set without materializing it. The conceptual
+     * left-to-right peak ordering puts the climbed acc at peak_idx and
+     * the remaining peaks (in order, with peak_idx skipped) in the tail
+     * of `proof`. So peak k is acc when k == peak_idx, else proof[off]
+     * with off = peak_height + k - (k > peak_idx ? 1 : 0). */
     if (pcount == 1) {
-        memcpy(root, peaks[0], 32);
-    } else {
-        memcpy(root, peaks[pcount - 1], 32);
-        for (size_t i = pcount - 1; i > 0; i--) {
-            uint8_t tmp[32];
-            hash_pair(peaks[i - 1], root, tmp);
-            memcpy(root, tmp, 32);
-        }
+        return memcmp(acc, expected_root, 32) == 0;
     }
-    return memcmp(root, expected_root, 32) == 0;
+    #define MERKLE__PEAK_AT(K) ((K) == peak_idx ? acc \
+        : proof[(size_t)peak_height + (K) - ((K) > peak_idx ? 1u : 0u)])
+    uint8_t fold[32];
+    memcpy(fold, MERKLE__PEAK_AT(pcount - 1), 32);
+    for (size_t i = pcount - 1; i > 0; i--) {
+        uint8_t tmp[32];
+        hash_pair(MERKLE__PEAK_AT(i - 1), fold, tmp);
+        memcpy(fold, tmp, 32);
+    }
+    #undef MERKLE__PEAK_AT
+    return memcmp(fold, expected_root, 32) == 0;
 }
 
 #endif /* MERKLE_IMPL */
